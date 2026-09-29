@@ -26,9 +26,9 @@ const OWNER_KEY = "";
 
 /* ============================================================
  * flow pocket — Cloudflare Worker relay — worker.js
- * BUILD: fp service 1.1 (sign-in navigation fix)
+ * BUILD: fp service 1.2 (sec-fetch-site fix)
  *   Deploy check: /__status on the worker URL must answer
- *   "fp service 1.1" — anything else is an old copy; replace it
+ *   "fp service 1.2" — anything else is an old copy; replace it
  *   with this file.
  * ------------------------------------------------------------
  * WHAT THIS DOES (the "no-navigation" architecture, ported from
@@ -136,7 +136,7 @@ const OWNER_KEY = "";
  *     URL never rides your sign-in.
  * ============================================================ */
 
-const VERSION = 'fp service 1.1';
+const VERSION = 'fp service 1.2';
 
 /* Google first-party family (suffix match — covers subdomains).
  * Flow itself lives at flow.google.com; the .google gTLD (a
@@ -369,6 +369,34 @@ const PATCH_JS = [
 "  }",
 "  if (SD) {",
 "    try { window.__flwLoc = makeLoc(); } catch (eL) { /* ignore */ }",
+"    /* v1.2 sign-in fix: arbitrary-receiver location reads. Google's",
+"     * Glif sign-in bundles wrap the window in services and read",
+"     * this.aa.location.href \u2014 a receiver chain the JS rewriter can",
+"     * rewrite to __flwRL(chain.location).href, and this helper decides",
+"     * AT RUNTIME whether that location is the sandbox's own (about:srcdoc",
+"     * \u2014 hand back the fake) or someone else's data/nested-frame",
+"     * location (hand it through untouched). */",
+"    try {",
+"      window.__flwRL = function (loc) {",
+"        try {",
+"          if (loc === window.location) return window.__flwLoc;",
+"          if (!loc) return loc;",
+"          /* typeof loc.href THROWS on a cross-origin frame's restricted",
+"           * Location \\u2014 exactly the read Google's botguard/bscframe",
+"           * machinery does on its challenge frame. The old fall-through",
+"           * handed the restricted object back out and the caller's",
+"           * .href blew up as an uncaught SecurityError, which the Glif",
+"           * error collector embedded in the next RPC \\u2014 and the server",
+"           * answered error 13 (\"Something went wrong\"). Return the fake",
+"           * location instead: its href is this document's real upstream",
+"           * URL, the best answer any sandboxed reader can get. */",
+"          if (typeof loc.href === 'string') {",
+"            return loc.href.indexOf('about:') === 0 ? window.__flwLoc : loc;",
+"          }",
+"          return loc;",
+"        } catch (eR) { return window.__flwLoc; }",
+"      };",
+"    } catch (eRL) { /* ignore */ }",
 "    /* document.URL / baseURI / documentURI \u2014 the parser reports",
 "     * about:srcdoc; SPA hydration wants the real upstream URL. These",
 "     * are plain accessors on Document.prototype (NOT unforgeable),",
@@ -1442,9 +1470,71 @@ const PATCH_JS = [
 "   * analytics does on the real site in China).",
 "   */",
 "  var RES_ATTRS = { IMG: ['src', 'srcset'], SCRIPT: ['src'], LINK: ['href'], SOURCE: ['src', 'srcset'], AUDIO: ['src', 'poster'], VIDEO: ['src', 'poster'], IFRAME: ['src'], OBJECT: ['data'], EMBED: ['src'], IMAGE: ['href'] };",
+"  /* ---------- v1.2: nested-iframe same-origin swap ----------------",
+"   * A nested <iframe src=worker-URL> loads at the WORKER origin while",
+"   * this sandbox document is null-origin \\u2014 every parent access to the",
+"   * frame (contentDocument writes, location reads) dies on the origin",
+"   * wall. Google's botguard needs exactly that: it loads the EMPTY",
+"   * /_/bscframe and writes the challenge program into it from here.",
+"   * So: hold every runtime-created iframe at about:blank (an about:blank",
+"   * child INHERITS this frame's origin \\u2014 fully same-origin, writable),",
+"   * fetch its URL through the relay in the background, and swap the",
+"   * content in as srcdoc ONLY when it is a real document. Empty",
+"   * upstreams (the bscframe pattern) stay about:blank forever \\u2014 the",
+"   * parent owns them, and __flwRL answers their location reads with",
+"   * this document's upstream URL so /^h/ style loaded-checks pass. */",
+"  function flwIframeHold(el, u) {",
+"    try {",
+"      var su = String(u == null ? '' : u);",
+"      if (!su) return false;",
+"      if (/^(about:|javascript:|data:|blob:)/i.test(su)) return false;",
+"      var mapped = mapUrl(su);",
+"      el.__flwSrc = su;",
+"      try { el.removeAttribute('src'); } catch (eR) {}",
+"      try {",
+"        fetch(mapped, { credentials: 'include' }).then(function (r) { return r.text(); }).then(function (t) {",
+"          if (el.__flwSrc !== su) return; /* superseded by a newer src */",
+"          el.__flwSrc = undefined;",
+"          if (t && t.length > 200 && /<(?:html|head|body|script|div|!doctype)/i.test(t)) {",
+"            try { el.setAttribute('srcdoc', t); } catch (eS) { try { el.srcdoc = t; } catch (eS2) { /* ignore */ } }",
+"          }",
+"          /* trivial/empty upstream \\u2192 keep the same-origin blank frame */",
+"        }).catch(function () { /* keep about:blank */ });",
+"      } catch (eF) { /* keep about:blank */ }",
+"      return true;",
+"    } catch (e) { return false; }",
+"  }",
+"  try {",
+"    var iFrameSrcDesc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'src');",
+"    if (iFrameSrcDesc && iFrameSrcDesc.set) {",
+"      Object.defineProperty(HTMLIFrameElement.prototype, 'src', {",
+"        get: function () {",
+"          try { if (this.__flwSrc !== undefined) return this.__flwSrc; } catch (eG) { /* fall through */ }",
+"          return iFrameSrcDesc.get.call(this);",
+"        },",
+"        set: function (u) {",
+"          var held = false;",
+"          try { held = flwIframeHold(this, u); } catch (eH) { held = false; }",
+"          if (!held) { try { iFrameSrcDesc.set.call(this, u); } catch (eS) { /* ignore */ } }",
+"        },",
+"        configurable: true",
+"      });",
+"    }",
+"  } catch (eIF) { /* ignore */ }",
 "  function fixEl(el) {",
 "    try {",
 "      if (!el || !el.tagName || !el.getAttribute || !el.setAttribute) return;",
+"      /* v1.2: iframes never keep a rewritten src attribute \u2014 the same-origin",
+"       * hold in flwIframeHold owns them (added/parsed markup with a src",
+"       * attribute funnels through here too). */",
+"      if (el.tagName.toUpperCase() === 'IFRAME') {",
+"        var isv = el.getAttribute('src');",
+"        if (isv) {",
+"          var held = false;",
+"          try { held = flwIframeHold(el, isv); } catch (eI2) { held = false; }",
+"          if (held) return;",
+"        }",
+"      }",
 "      var attrs = RES_ATTRS[el.tagName.toUpperCase()];",
 "      if (!attrs) return;",
 "      for (var i = 0; i < attrs.length; i++) {",
@@ -2280,6 +2370,101 @@ async function handleSession(req, url, event) {
       return json({ ok: true, mode: 'auto', unclaimed: true, has: false, savedAt: 0, token: '', role: '', id: '', email: '', name: '', jar: jar }, req);
     }
   }
+  if (method === 'PUT' || method === 'POST') {
+    /* v1.2: IMPORT — "forward my account". Paste the Google session
+     * cookies from a real signed-in browser (Chrome DevTools →
+     * Application → Cookies → accounts.google.com, a cookie-export
+     * extension, or chrome://inspect remote debugging for a phone)
+     * and the relay adopts them as its held jar. This is the fallback
+     * for environments where the in-app sign-in is refused (botguard,
+     * risk walls): sign in NORMALLY in Chrome, then bring the session
+     * here. Accepted shapes, auto-detected:
+     *   - raw Cookie header:   "SID=aa; HSID=bb; SAPISID=cc"
+     *   - one per line:        "SID=aa\nHSID=bb"
+     *   - Netscape export:     ".google.com<TAB>TRUE<TAB>/<TAB>TRUE<TAB>0<TAB>SID<TAB>aa"
+     *   - cookie-editor JSON:  [{"name":"SID","value":"aa"},...]
+     *   - JSON object/string:  {"cookies":"SID=aa; ..."} / "SID=aa; ..."
+     * Only *.google.com session names are kept; a core session cookie
+     * (SID / HSID / SAPISID / __Secure-1PSID / __Secure-3PAPISID) must
+     * be present or the import is refused. */
+    let raw = '';
+    try { raw = await req.text(); } catch (eT) { raw = ''; }
+    let pasted = raw;
+    try {
+      const j = JSON.parse(raw);
+      if (Array.isArray(j)) {
+        pasted = j.map((c) => (c && c.name && c.value !== undefined) ? (c.name + '=' + c.value) : '').filter(Boolean).join('; ');
+      } else if (j && typeof j === 'object') {
+        const c = j.cookies || j.cookie || j.jar || j.header || '';
+        if (typeof c === 'string') pasted = c;
+        else if (c && typeof c === 'object') pasted = Object.keys(c).map((k) => k + '=' + c[k]).join('; ');
+      }
+    } catch (eJ) { /* not JSON — treat as raw text */ }
+    /* collect name=value pairs out of whatever shape arrived */
+    const jar = {};
+    String(pasted).split(/\r?\n/).forEach((line) => {
+      const l = line.replace(/^\s*#.*$/, '').trim();
+      if (!l) return;
+      /* netscape line: domain \t flag \t path \t secure \t expiry \t name \t value */
+      if (l.indexOf('\t') >= 0) {
+        const parts = l.split('\t');
+        if (parts.length >= 7) {
+          const name = parts[5].trim(), value = parts[6].trim();
+          if (name) jar[name] = value;
+          return;
+        }
+        /* devtools copy: name \t value */
+        if (parts.length === 2) {
+          const name = parts[0].trim(), value = parts[1].trim();
+          if (name) jar[name] = value;
+          return;
+        }
+      }
+      /* header / per-line forms: one or more name=value separated by ';' */
+      l.split(';').forEach((kv) => {
+        const eq = kv.indexOf('=');
+        if (eq < 1) return;
+        const name = kv.slice(0, eq).trim();
+        const value = kv.slice(eq + 1).trim();
+        if (name && !/^(domain|path|expires|max-age|size|httponly|secure|samesite)$/i.test(name)) jar[name] = value;
+      });
+    });
+    /* keep only the Google session family */
+    const keepRe = /^(SID|HSID|SSID|SAPISID|APISID|NID|AEC|SOCS|CONSENT|GAPS|__Host-GAPS|SIDCC|__Secure-1PSID|__Secure-3PSID|__Secure-1PAPISID|__Secure-3PAPISID|__Secure-1PSIDTS|__Secure-3PSIDTS|__Secure-1PSIDCC|__Secure-3PSIDCC|__Secure-ENID|__Secure-1PLSID|__Secure-3PLSID)$/;
+    const filtered = {};
+    Object.keys(jar).forEach((k) => { if (keepRe.test(k)) filtered[k] = jar[k]; });
+    if (!jarHasGoogleUser(filtered)) {
+      const found = Object.keys(jar).slice(0, 12);
+      return json({
+        ok: false,
+        error: 'no Google sign-in cookies in that paste — the relay needs at least one of SID / HSID / SAPISID / __Secure-1PSID / __Secure-3PAPISID. Copy them from a browser that is signed in to google.com.',
+        saw: found,
+      }, req, 400);
+    }
+    const st = await sessionRead(req);
+    const merged = Object.assign({}, st.jar, filtered);
+    const doc = {
+      jar: merged, token: st.token || '', role: st.role || 'user', id: st.id || '',
+      em: st.em || '', nm: st.nm || '', key: st.key || '', stale: 0,
+      ts: Date.now(), imp: Date.now(),
+    };
+    /* an unclaimed slot mints its key and hands it to THIS importer —
+     * the import IS a claim (identical to signing in). */
+    let claimKey = '';
+    if (!doc.key) {
+      doc.key = newSlotKey();
+      claimKey = doc.key;
+    }
+    await sessionWrite(req, doc);
+    const res = {
+      ok: true, imported: Object.keys(filtered).length, cookies: Object.keys(filtered),
+      note: 'session imported — open the app, it boots signed in',
+    };
+    if (claimKey) res.claim = claimKey;
+    const rh = new Headers({ 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+    if (claimKey) rh.set('x-fp-claim', claimKey);
+    return new Response(JSON.stringify(res), { status: 200, headers: corsHeaders(req, rh) });
+  }
   if (method === 'GET' || method === 'HEAD') {
     const st = await sessionRead(req);
     /* keep-alive: the pocket pulls this on every open of the
@@ -2586,7 +2771,20 @@ async function handle(req, event) {
     const h = new Headers();
     const skipReq = new Set(['host', 'origin', 'referer', 'cookie', 'connection', 'keep-alive', 'upgrade',
       'proxy-connection', 'te', 'trailer', 'transfer-encoding', 'content-length', 'accept-encoding',
-      'x-cookie', 'x-proxy-token', 'x-set-cookie', 'x-fp-owner', 'x-fp-claim']);
+      'x-cookie', 'x-proxy-token', 'x-set-cookie', 'x-fp-owner', 'x-fp-claim', 'sec-fetch-site', 'sec-fetch-storage-access']);
+    /* v7.3: sec-fetch-site is dropped from the forwarded set and stamped
+     * as same-origin below. The pocket paints every page inside a
+     * null-origin sandbox frame, so the browser labels EVERY proxied
+     * request Sec-Fetch-Site: cross-site — and Google's front ends
+     * (GFE Fetch Metadata enforcement) 403 exactly that on state-
+     * changing endpoints: flow.google.com/_/.../data/batchexecute and
+     * accounts.google.com/v3/signin/* both reject cross-site POSTs
+     * before any auth logic runs (verified: same POST returns 401 with
+     * same-origin, 403 with cross-site). From upstream's point of view
+     * the request IS same-origin — the worker is invisible — so the
+     * honest stamp is same-origin. sec-fetch-storage-access goes too:
+     * the sandbox always reports none, which would contradict the
+     * same-origin story the other headers tell. */
     /* v7.1: x-fp-owner is this relay's OWN gate header (the owner
      * key the pocket sends) — it must NEVER ride upstream.
      * v7.2: x-fp-claim (the minted-key RESPONSE header) is likewise
@@ -2624,6 +2822,7 @@ async function handle(req, event) {
     h.set('cookie', mergeCookies(req.headers.get('cookie') || '', req.headers.get('x-cookie') || ''));
     h.set('origin', 'https://' + host);
     h.set('referer', 'https://' + host + '/');
+    h.set('sec-fetch-site', 'same-origin');
 
     let body = undefined;
     let needDuplex = false;
@@ -3393,6 +3592,22 @@ function rewriteHtml(text, pfx, host, workerOrigin, token, allow, tokDoc) {
       return pre + '"' + nv.replace(/"/g, '&quot;') + '"';
     });
 
+    /* v1.2 Glif sign-in fix: INLINE SCRIPTS. rewriteJsLocation only ever
+     * ran on external .js responses — but the Glif identifier page carries
+     * a keypress handler INLINE that reads
+     *   z.contentWindow.location.href.match(/^h/)
+     * on the cross-origin bscframe → raw SecurityError, which the flow's
+     * error collector embedded into the next RPC. Rewrite classic inline
+     * script bodies with the same conservative pass (src= and data-island
+     * types are skipped). */
+    text = text.replace(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi, (whole, attrs, body) => {
+      if (!body || !/location\b/.test(body)) return whole;
+      if (/\bsrc\s*=/i.test(attrs)) return whole;
+      if (/\btype\s*=\s*["']?(?:application\/(?:json|ld\+json)|text\/(?:template|html|plain)|application\/template)/i.test(attrs)) return whole;
+      const nb = rewriteJsLocation(body);
+      return nb === body ? whole : '<scr' + 'ipt' + attrs + '>' + nb + '</scr' + 'ipt>';
+    });
+
     /* inject config + runtime patch as the first script; v6 also injects
      * a <base> pointing at this document's /__o/ mirror — the sandbox
      * document sits at about:srcdoc where relative URLs resolve against
@@ -3407,7 +3622,18 @@ function rewriteHtml(text, pfx, host, workerOrigin, token, allow, tokDoc) {
     if (tokDoc) {
       try {
         const bOp = oTokPath(tokDoc);
-        if (bOp) inject = '<base href="' + (workerOrigin ? workerOrigin.replace(/\/$/, '') : '') + bOp + '">' + inject;
+        /* v1.2 Glif sign-in fix: inject our <base> ONLY when the upstream
+         * page has none of its own. Google's sign-in pages ship exactly
+         * one <base href="https://accounts.google.com/v3/signin/\"> \u2014 the
+         * attr pass above already rewrites it to this worker's /__o/
+         * mirror, so runtime relative refs still resolve onto the worker.
+         * Injecting a SECOND base on top of it left the document with
+         * two, and the Glif bundle's _.Oab does
+         *   getElementsByTagName('BASE').length == 1 ? parse : null
+         * \u2014 the null then crashed .replace() and the sign-in died with
+         * "Something went wrong". One document, one base. */
+        const hasOwnBase = /<base\b[^>]*\bhref\s*=/i.test(text);
+        if (bOp && !hasOwnBase) inject = '<base href="' + (workerOrigin ? workerOrigin.replace(/\/$/, '') : '') + bOp + '">' + inject;
       } catch (eB) { /* ignore */ }
     }
     if (/<head[^>]*>/i.test(text)) text = text.replace(/<head[^>]*>/i, (m) => m + inject);
@@ -3512,6 +3738,41 @@ function rewriteJsLocation(text) {
       (w, prop) => '__flwLoc.' + prop);
     out = out.replace(/[\w$]+(?:\??\.[\w$]+)*\??\.defaultView\.location(?![.\w$])(?!\s*=(?!=))/g,
       '__flwLoc');
+    /* v1.2 Glif sign-in fix: ARBITRARY-receiver location reads \u2014
+     * this.aa.location.href, b.location.origin, c.d?.location.assign \u2026
+     * Google's compiled services wrap window/document and reach the
+     * location through fields the prefixed rules can never see. The
+     * receiver chain is captured and wrapped in the runtime helper
+     * __flwRL (injected with the patch): if that .location is the
+     * sandbox's own (=== window.location, or its href is about:*) the
+     * helper swaps in __flwLoc, otherwise it passes the value through
+     * untouched \u2014 data objects with a .location field and nested-frame
+     * handles keep their original behavior. Assignment targets keep
+     * working too: __flwRL(x.location).href = v writes the fake (nav)
+     * when it is the sandbox location, the data object when it is not.
+     * Runs LAST so .document.location / .defaultView.location forms are
+     * already same-shape-swapped and cannot be double-processed. */
+    /* Writes FIRST (plain member, no ?. — optional-chained members are
+     * illegal assignment targets, so x.location.href = v rewrites to a
+     * plain __flwRL(x.location).href the fake's href setter can take).
+     * The receiver now also tolerates ONE call tail — compiled Google
+     * reads like _.Vm().location.href arrive as call receivers. */
+    out = out.replace(/([A-Za-z_$][\w$]*(?:\??\.[A-Za-z_$][\w$]*)*(?:\([^()]{0,100}\))?(?:\??\.[A-Za-z_$][\w$]*)*)\.location\??\.(href|assign|replace|reload|pathname|search|hash|origin|host|hostname|protocol|port|toString)\b(?=\s*=(?!=))/g,
+      (w, recv, prop) => '__flwRL(' + recv + '.location).' + prop);
+    /* Reads: keep the optional chain on the outer access so null
+     * receivers still yield undefined instead of throwing. */
+    out = out.replace(/([A-Za-z_$][\w$]*(?:\??\.[A-Za-z_$][\w$]*)*(?:\([^()]{0,100}\))?(?:\??\.[A-Za-z_$][\w$]*)*)(\??)\.location\??\.(href|assign|replace|reload|pathname|search|hash|origin|host|hostname|protocol|port|toString)\b(?!\s*=(?!=))/g,
+      (w, recv, q, prop) => '__flwRL(' + recv + q + '.location)?.' + prop);
+    /* v1.2: WHOLE-OBJECT generic reads LAST — f(a.location), compares,
+     * _.Zl(this.aa.location, url) … the compiled bundles pass the
+     * location OBJECT around and the callee reads .href inside its own
+     * (unrewritable) code. Wrapping the object read sends the callee the
+     * fake for the sandbox's own / restricted locations — its .href then
+     * answers the real upstream URL — and the plain data .location
+     * through untouched. Assignment targets are excluded (they are real
+     * navigations the member write-rule above owns). */
+    out = out.replace(/([A-Za-z_$][\w$]*(?:\??\.[A-Za-z_$][\w$]*)*(?:\([^()]{0,100}\))?(?:\??\.[A-Za-z_$][\w$]*)*)\.location(?![.\w$])(?!\s*=(?!=))/g,
+      (w, recv) => '__flwRL(' + recv + '.location)');
     return out;
   } catch (e) {
     return text;
