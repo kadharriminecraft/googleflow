@@ -26,9 +26,9 @@ const OWNER_KEY = "";
 
 /* ============================================================
  * flow pocket — Cloudflare Worker relay — worker.js
- * BUILD: fp service 1.2 (sec-fetch-site fix)
+ * BUILD: fp service 1.3 (bscframe same-origin fix)
  *   Deploy check: /__status on the worker URL must answer
- *   "fp service 1.2" — anything else is an old copy; replace it
+ *   "fp service 1.3" — anything else is an old copy; replace it
  *   with this file.
  * ------------------------------------------------------------
  * WHAT THIS DOES (the "no-navigation" architecture, ported from
@@ -136,7 +136,7 @@ const OWNER_KEY = "";
  *     URL never rides your sign-in.
  * ============================================================ */
 
-const VERSION = 'fp service 1.2';
+const VERSION = 'fp service 1.3';
 
 /* Google first-party family (suffix match — covers subdomains).
  * Flow itself lives at flow.google.com; the .google gTLD (a
@@ -171,7 +171,7 @@ const ALLOW = [
  * with the runtime patch via window.__FLW__.key (build asserts the
  * template carries exactly one TOK_KEY definition). ?url= is NOT
  * accepted: tokens are the only way in. */
-const TOK_KEY_BASE = 'flowtok-1-0-0-Fq7wZx2Lm';
+const TOK_KEY_BASE = 'flowtok-1-0-3-Fq7wZx2Lm';
 /* v7.4: keyed relays re-key the whole token space with a mask
  * derived from the OWNER_KEY (never the key itself — the mask rides
  * to the client as __FLW__.key exactly like TOK_KEY always has, and
@@ -279,6 +279,37 @@ const PATCH_JS = [
 "  var lsMirror = {};                  // fallback localStorage mirror (for browsers that block it in iframes)",
 "  var upQueue = [];",
 "",
+"  /* ---------- v1.3: botguard eval-chain window redirect ------------",
+"   * Google's botguard VM evals its program, and that program evals",
+"   * sub-programs several levels deep; every level grabs a hidden",
+"   * iframe's contentWindow and runs the next stage inside it. In",
+"   * this null-origin srcdoc sandbox every child frame is forced",
+"   * into its own opaque origin (sandbox flags propagate down the",
+"   * frame tree), so any W.eval(...) read throws, the identifier",
+"   * submit never fires, and sign-in spins forever after the email",
+"   * step. Wrapping window.eval itself catches EVERY level of the",
+"   * chain - indirect (0,eval) resolves the global property, so the",
+"   * wrap applies there too: strings that look like bg programs get",
+"   * their frame-window grabs redirected to THIS window, which is",
+"   * always same-origin with itself. */",
+"  try {",
+"    var flwNativeEval = window.eval;",
+"    if (typeof flwNativeEval === 'function') {",
+"      window.eval = function (s) {",
+"        try {",
+"          window.__FLW_EVAL_WRAPS = (window.__FLW_EVAL_WRAPS || 0) + 1;",
+"          if (typeof s === 'string' && (s.indexOf('.eval(') > -1 || s.indexOf('.contentWindow') > -1 || s.indexOf('frames[') > -1 || s.indexOf('.document') > -1)) {",
+"            s = s.replace(/([A-Za-z_$][A-Za-z0-9_$]*)\\s*=\\s*([A-Za-z_$][A-Za-z0-9_$]*)\\.contentWindow\\b/g, '$1=window');",
+"            s = s.replace(/([A-Za-z_$][A-Za-z0-9_$]*)\\s*\\.\\s*eval\\s*\\(/g, 'window.eval(');",
+"            s = s.replace(/([A-Za-z_$][A-Za-z0-9_$]*)\\s*\\.\\s*document\\b/g, 'window.document');",
+"            s = s.replace(/(?<![.\\w])(?:window\\s*\\.\\s*)?frames\\s*\\[\\s*\\d+\\s*\\]/g, 'window');",
+"          }",
+"        } catch (eFE) { }",
+"        return flwNativeEval.call(window, s);",
+"      };",
+"    }",
+"  } catch (eEV) { }",
+"",
 "  /* ---------- v5: absolute worker URLs --------------------------------",
 "   * Inside the sandbox frame the document sits at about:srcdoc, so a",
 "   * mapped path like /__t/<token> is unresolvable on its own \u2014 it must",
@@ -318,6 +349,17 @@ const PATCH_JS = [
 "      var mapped = mapUrl(s);",
 "      var upUrl = '';",
 "      try { upUrl = new URL(s, DOC || location.href).href; } catch (eU) { upUrl = s; }",
+"      /* v1.3: worker-origin destinations report their UPSTREAM form as",
+"       * the nav's up URL (address bar + history), never the worker */",
+"      try {",
+"        var wo = WORKER ? WORKER.replace(/\\/$/, '') : '';",
+"        if (wo && upUrl.indexOf(wo) === 0) {",
+"          var rp = upUrl.slice(wo.length) || '/';",
+"          var mro = rp.match(/^\\/__o\\/[^/]+(.*)$/);",
+"          if (mro) rp = mro[1] || '/';",
+"          upUrl = 'https://' + HOST + rp;",
+"        }",
+"      } catch (eU2) { /* keep upUrl */ }",
 "      up({ type: 'navreq', url: mapped, up: upUrl, method: method || 'GET', body: body || null, ct: ct || null });",
 "      return s;",
 "    } catch (e) { return u; }",
@@ -499,7 +541,17 @@ const PATCH_JS = [
 "   * point at the worker (same-origin) instead of the upstream host.",
 "   */",
 "  function originStr() {",
-"    try { return location.origin || (location.protocol + '//' + location.host); } catch (e) { return ''; }",
+"    /* v1.3: in sandbox mode the document lives at about:srcdoc, where",
+"     * location.origin is the STRING \"null\" - every worker-origin",
+"     * absolute URL (SPA navigations absolutized against our injected",
+"     * base, like the Glif app's /v3/signin/rejected hop) then fell",
+"     * through the same-origin branch, failed the allowlist and passed",
+"     * through UNMAPPED, which the shell cannot route. The document's",
+"     * serving origin in sandbox mode IS the worker. */",
+"    try {",
+"      if (SD && WORKER) return WORKER.replace(/\\/$/, '');",
+"      return location.origin || (location.protocol + '//' + location.host);",
+"    } catch (e) { return ''; }",
 "  }",
 "  function hasPfx(str) {",
 "    if (!PFX) return true;",
@@ -515,10 +567,19 @@ const PATCH_JS = [
 "  }",
 "  function isProxyPath(p) {",
 "    if (!p) return false;",
+"    if (/^\\/__(t|o)\\//.test(p)) return true; // v4/v6 token paths (full-URL / origin+path)",
+"    if (/^\\/__(status|clear|diag|session|dbg)([\\/?#]|$)/.test(p)) return true;",
+"    if (TOK) {",
+"      /* v1.3: token mode + empty PFX made hasPfx() vacuously TRUE, so",
+"       * EVERY bare path looked \"already proxied\" and sailed through",
+"       * unmapped (the /v3/signin/rejected hop after the identifier RPC",
+"       * 404ed on the worker root). In token mode a proxy path is a",
+"       * token/mirror path, a meta route or a legacy /p/<host>/ path —",
+"       * anything else belongs to the upstream and must be tokenized. */",
+"      return isCrossHostPath(p);",
+"    }",
 "    if (hasPfx(p)) return true;",
 "    if (isCrossHostPath(p)) return true;",
-"    if (/^\\/__(t|o)\\//.test(p)) return true; // v4/v6 token paths (full-URL / origin+path)",
-"    if (/^\\/__(status|clear)([\\/?#]|$)/.test(p)) return true;",
 "    return false;",
 "  }",
 "",
@@ -565,6 +626,18 @@ const PATCH_JS = [
 "          // still belongs to this document's upstream",
 "          var sp = str.slice(org.length) || '/';",
 "          if (isProxyPath(sp)) return sp;",
+"          /* v1.3: a WORKER-origin absolute URL that is not already a proxy",
+"           * path still belongs to this document's upstream (the Glif app",
+"           * navigates to /v3/signin/rejected after the identifier RPC,",
+"           * absolutized against our injected base) - tokenize it against",
+"           * the upstream DOC instead of emitting a bare worker path the",
+"           * shell cannot route. Meta routes stay untouched. */",
+"          if (TOK && DOC && !/^\\/__(status|clear|diag|session|dbg)([\\/?#]|$)/.test(sp)) {",
+"            try {",
+"              var t5 = tokPath(new URL(sp, DOC).href);",
+"              if (t5) return t5;",
+"            } catch (e5) { /* fall through */ }",
+"          }",
 "          return PFX + sp;",
 "        }",
 "        if (!allowedHost(host)) return str;                    // external: leave (usually analytics)",
@@ -1479,23 +1552,39 @@ const PATCH_JS = [
 "   * So: hold every runtime-created iframe at about:blank (an about:blank",
 "   * child INHERITS this frame's origin \\u2014 fully same-origin, writable),",
 "   * fetch its URL through the relay in the background, and swap the",
-"   * content in as srcdoc ONLY when it is a real document. Empty",
-"   * upstreams (the bscframe pattern) stay about:blank forever \\u2014 the",
-"   * parent owns them, and __flwRL answers their location reads with",
-"   * this document's upstream URL so /^h/ style loaded-checks pass. */",
+"   * content in as srcdoc ONLY when it is a real document.",
+"   * v1.3: \"real document\" is measured on the upstream CORE - the fetch",
+"   * text minus this relay's own injected runtime block (base + __FLW__",
+"   * config + patch, ~80KB). The bscframe's true upstream is a 15-byte",
+"   * doctype shell; measuring the INFLATED text made the hold swap it to",
+"   * srcdoc anyway, and a srcdoc child gets a FRESH opaque origin - so",
+"   * botguard's bscframe.contentWindow.eval(...) died on the origin wall,",
+"   * the identifier submit never fired, and sign-in spun forever after",
+"   * the email step. Trivial cores (and bscframe URLs, always) stay",
+"   * about:blank forever - the parent owns them, and __flwRL answers",
+"   * their location reads with this document's upstream URL so /^h",
+"   * style loaded-checks pass. */",
 "  function flwIframeHold(el, u) {",
 "    try {",
 "      var su = String(u == null ? '' : u);",
 "      if (!su) return false;",
 "      if (/^(about:|javascript:|data:|blob:)/i.test(su)) return false;",
+"      /* v1.3: the bscframe is ALWAYS the app's own same-origin scratch",
+"       * frame - botguard writes and evals its program into it from here.",
+"       * Never fetch it, never swap it: a pristine about:blank, no matter",
+"       * what the upstream serves. */",
+"      if (/bscframe/i.test(su)) { el.__flwSrc = su; el.__flwHeld = true; try { el.removeAttribute('src'); } catch (eRB) {} return true; }",
 "      var mapped = mapUrl(su);",
 "      el.__flwSrc = su;",
+"      el.__flwHeld = true;",
 "      try { el.removeAttribute('src'); } catch (eR) {}",
 "      try {",
 "        fetch(mapped, { credentials: 'include' }).then(function (r) { return r.text(); }).then(function (t) {",
 "          if (el.__flwSrc !== su) return; /* superseded by a newer src */",
 "          el.__flwSrc = undefined;",
-"          if (t && t.length > 200 && /<(?:html|head|body|script|div|!doctype)/i.test(t)) {",
+"          var core = String(t || '').replace(/<script>window\\.__FLW__=[\\s\\S]*?<\\/script>/, '');",
+"          if (core.replace(/\\s+/g, '').length > 240 && /<(?:html|head|body|script|div|!doctype)/i.test(core)) {",
+"            el.__flwSwap = true; el.__flwHeld = false;",
 "            try { el.setAttribute('srcdoc', t); } catch (eS) { try { el.srcdoc = t; } catch (eS2) { /* ignore */ } }",
 "          }",
 "          /* trivial/empty upstream \\u2192 keep the same-origin blank frame */",
@@ -1521,6 +1610,60 @@ const PATCH_JS = [
 "      });",
 "    }",
 "  } catch (eIF) { /* ignore */ }",
+"  /* ---------- v1.3: held-frame window proxy -------------------------",
+"   * Every child frame inside this null-origin sandbox is forced into",
+"   * its own opaque origin (sandbox flags propagate down the frame",
+"   * tree), so any window the app or botguard grabs from a held or",
+"   * srcless scratch frame is cross-origin: .eval / .document /",
+"   * .location reads on it throw, the bg chain dies, and Google's error",
+"   * collector even ships the SecurityError inside the identifier RPC",
+"   * (the server then answers /v3/signin/rejected). Hand those frames",
+"   * THIS window instead - wrapped in a proxy that answers .location",
+"   * with the fake upstream location and binds functions here, so",
+"   * frame-shaped code just works. Swapped frames (real documents",
+"   * rendered via srcdoc) and frames with a live src keep their real",
+"   * contentWindow. */",
+"  var flwHeldWin = null;",
+"  function flwGetHeldWin() {",
+"    if (flwHeldWin) return flwHeldWin;",
+"    var bound = {};",
+"    flwHeldWin = new Proxy(window, {",
+"      get: function (t, k) {",
+"        try {",
+"          if (k === 'location') return window.__flwLoc || t.location;",
+"          if (k === 'document') return t.document;",
+"          if (k === 'self' || k === 'window' || k === 'top' || k === 'parent' || k === 'frames') return flwHeldWin;",
+"          var v = t[k];",
+"          if (typeof v === 'function') return bound[k] || (bound[k] = v.bind(t));",
+"          /* any WINDOW-valued property (frames[0], numeric indexes, a",
+"           * stashed child window) hands back the proxy too - never a",
+"           * real cross-origin child window whose reads would throw */",
+"          if (v !== null && typeof v === 'object') { try { if (v.self === v) return flwHeldWin; } catch (eWv) { } }",
+"          return v;",
+"        } catch (ePW) { return undefined; }",
+"      }",
+"    });",
+"    return flwHeldWin;",
+"  }",
+"  try {",
+"    function flwIsScratch(el) {",
+"      try {",
+"        if (el.__flwSwap) return false;",
+"        if (el.__flwHeld) return true;",
+"        return !el.getAttribute('src') && !el.getAttribute('srcdoc');",
+"      } catch (eSc) { return false; }",
+"    }",
+"    var flwCwDesc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow');",
+"    if (flwCwDesc && flwCwDesc.get) Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {",
+"      configurable: true,",
+"      get: function () { try { if (flwIsScratch(this)) return flwGetHeldWin(); } catch (eG2) { /* fall through */ } return flwCwDesc.get.call(this); }",
+"    });",
+"    var flwCdDesc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentDocument');",
+"    if (flwCdDesc && flwCdDesc.get) Object.defineProperty(HTMLIFrameElement.prototype, 'contentDocument', {",
+"      configurable: true,",
+"      get: function () { try { if (flwIsScratch(this)) return window.document; } catch (eG3) { /* fall through */ } return flwCdDesc.get.call(this); }",
+"    });",
+"  } catch (eCWP) { /* ignore */ }",
 "  function fixEl(el) {",
 "    try {",
 "      if (!el || !el.tagName || !el.getAttribute || !el.setAttribute) return;",
@@ -3055,6 +3198,15 @@ async function handle(req, event) {
      * reads it, saves it, and rides it from the next request on. */
     if (claimStamp) outHeaders.set('x-fp-claim', claimStamp);
     const outCt = corsHeaders(req, outHeaders);
+    /* v1.3: every rewritten body is served fresh. Google ships its
+     * bundles as immutable + max-age=31536000 — passed through, that
+     * pins an OLD rewrite in the phone's browser cache and a fixed
+     * worker keeps serving the stale pre-fix copy forever. (The
+     * version-bumped TOK_KEY below cache-busts everything once for
+     * phones that already hold immutable copies; no-store keeps it
+     * right from here on.) Media and other pass-through types keep
+     * their original cache headers — they are never rewritten. */
+    outCt.set('cache-control', 'no-store');
 
     if (ct.includes('text/html')) {
       const text = await res.text();
@@ -3111,7 +3263,9 @@ async function handle(req, event) {
      * entire bundle at parse time. */
     if (tokMode && /javascript|ecmascript|text\/jscript/i.test(ct)) {
       const text = await res.text();
-      const js = rewriteJsLocation(text);
+      /* v1.3: botguard window-redirect first, then the location pass —
+       * both on every served script. */
+      const js = rewriteJsLocation(rewriteJsBotguard(text));
       if (js !== text) {
         const h2 = new Headers(outCt);
         h2.set('x-fp-jsrw', '1');
@@ -3592,6 +3746,43 @@ function rewriteHtml(text, pfx, host, workerOrigin, token, allow, tokDoc) {
       return pre + '"' + nv.replace(/"/g, '&quot;') + '"';
     });
 
+    /* v1.3: BOTGUARD PROGRAM REDIRECT. The bg VM ships as a STRING
+     * inside AF_initDataCallback data islands and the bundle runs it as
+     * a dynamically injected inline <script> — never through window.eval
+     * (verified live: the runtime eval wrapper counted zero calls), so
+     * the only place its SOURCE is rewritable text is right here. The
+     * program creates a hidden iframe, waits for it, grabs its
+     * contentWindow and runs its sub-programs inside it — same-origin
+     * machinery this null-origin sandbox cannot provide (every child
+     * frame is forced into its own opaque origin by sandbox-flag
+     * propagation). Inside script bodies that carry BOTH 'botguard' and
+     * 'contentWindow' (the bg signature — never the app's own code):
+     *   - X=Y.contentWindow / X\u003dY.contentWindow  ->  X=window
+     *   - X.eval( / X\u002eeval(                      ->  window.eval(
+     * The frame-load /^h/ checks (z.contentWindow.location reads) are
+     * NOT assignments and stay untouched — __flwRL keeps answering
+     * them with the upstream URL. Sub-programs eval'd at runtime then
+     * flow through the runtime's wrapped window.eval, which applies the
+     * same redirects to every deeper level of the chain. */
+    text = text.replace(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi, (whole, attrs, body) => {
+      try {
+        if (!body || body.length > 400000) return whole;
+        if (body.indexOf('botguard') < 0 || body.indexOf('contentWindow') < 0) return whole;
+        if (body.indexOf('__FLW__') > -1 || body.indexOf('__flw') > -1) return whole; /* our own injected patch, never the upstream program */
+        let nb = body;
+        /* (?<!\\) — never start an identifier mid-escape; the receiver
+         * pattern carries an optional separator prefix ($1, re-emitted)
+         * so a match begins at the escape BOUNDARY: A\u003dw.eval( rewrites
+         * to A\u003dwindow.eval( instead of eating the escape's tail and
+         * leaving a dangling A\u003 behind. */
+        nb = nb.replace(/(?<!\\)((?:\\u003d|=)?\s*)([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:\\u002e|\.)\s*eval\s*\(/g, '$1window.eval(');
+        nb = nb.replace(/(?<!\\)([A-Za-z_$][A-Za-z0-9_$]*)(?:\\u003d|=)\s*([A-Za-z_$][A-Za-z0-9_$]*)\.contentWindow\b/g, '$1=window');
+        nb = nb.replace(/(?<!\\)((?:\\u003d|=)?\s*)([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:\\u002e|\.)\s*document\b/g, '$1window.document');
+        nb = nb.replace(/(?<![.\w])(?:window\s*\.\s*)?frames\s*\[\s*\d+\s*\]/g, 'window');
+        return nb === body ? whole : '<scr' + 'ipt' + attrs + '>' + nb + '</scr' + 'ipt>';
+      } catch (eBGH) { return whole; }
+    });
+
     /* v1.2 Glif sign-in fix: INLINE SCRIPTS. rewriteJsLocation only ever
      * ran on external .js responses — but the Glif identifier page carries
      * a keypress handler INLINE that reads
@@ -3688,6 +3879,38 @@ function rewriteCss(text, pfx, host, allow, tokDoc, workerOrigin) {
  *       location getters. Left raw, `window.location` in the sandbox
  *       is about:srcdoc (hostname ""), and every challenge token
  *       would be minted for the wrong scene and rejected. */
+/* ---------------- v1.3: botguard VM window-redirect ----------------
+ * Google's sign-in bundles ship exactly ONE indirect-eval helper of the
+ * shape  X = function (a) { (0, eval)(a) }  — every dynamically eval'd
+ * payload (botguard's obfuscated VM program among them) funnels through
+ * it. The bg program creates a hidden iframe, waits for it, then runs
+ * its sub-programs via frame.contentWindow.eval(...) — same-origin
+ * machinery a null-origin srcdoc sandbox can NEVER provide (sandbox
+ * flags propagate down the tree: every child frame is forced into its
+ * own fresh opaque origin, so the .eval read throws, the identifier
+ * submit never fires, and sign-in spins forever after the email step).
+ * Wrapping the helper redirects X=Y.contentWindow assignments to the
+ * MAIN window inside eval'd strings only (parsed code is untouched),
+ * so the VM runs its sub-programs in the app's own always-same-origin
+ * window. The frame-load /^h/ checks keep answering through __flwRL. */
+function rewriteJsBotguard(text) {
+  try {
+    if (text.indexOf('(0,eval)') < 0 && text.indexOf('(0, eval)') < 0) return text;
+    const re = /=\s*function\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\)\s*\{\s*\(0,\s*eval\s*\)\s*\(\s*\1\s*\)\s*\}/g;
+    let did = false;
+    const out = text.replace(re, function (whole, pn) {
+      did = true;
+      return '=function(' + pn + "){try{if(typeof " + pn + "==='string'&&" + pn +
+        ".indexOf('.contentWindow')>-1){" + pn + "=" + pn +
+        ".replace(/([A-Za-z_$][A-Za-z0-9_$]*)=([A-Za-z_$][A-Za-z0-9_$]*)\\.contentWindow\\b/g,'$1=window')}}" +
+        "catch(eFLWBG){}(0,eval)(" + pn + ")}";
+    });
+    return did ? out : text;
+  } catch (e) {
+    return text;
+  }
+}
+
 function rewriteJsLocation(text) {
   try {
     if (!/location\b/.test(text)) return text;
