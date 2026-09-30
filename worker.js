@@ -26,7 +26,9 @@ const OWNER_KEY = "";
 
 /* ============================================================
  * flow pocket — Cloudflare Worker relay — worker.js
- * BUILD: fp service 1.3 (bscframe same-origin fix)
+ * BUILD: fp service 1.4 (cookie-faithful hops: server-side
+ *   redirect walking + the session jar on every document fetch
+ *   — the post-password "cookies are disabled" wall is dead)
  *   Deploy check: /__status on the worker URL must answer
  *   "fp service 1.3" — anything else is an old copy; replace it
  *   with this file.
@@ -136,7 +138,7 @@ const OWNER_KEY = "";
  *     URL never rides your sign-in.
  * ============================================================ */
 
-const VERSION = 'fp service 1.3';
+const VERSION = 'fp service 1.4';
 
 /* Google first-party family (suffix match — covers subdomains).
  * Flow itself lives at flow.google.com; the .google gTLD (a
@@ -895,6 +897,12 @@ const PATCH_JS = [
 "          } else { H = new Headers(); }",
 "        } catch (e3) { H = new Headers(); }",
 "        init.headers = applyHeaders(H, workerDest((typeof input === 'string') ? input : (input && input.url) || ''));",
+"        /* v1.4: app code asking for redirect:'manual' wants to see",
+"         * the 3xx itself — tell the worker to pass redirects",
+"         * through instead of walking the chain server-side. */",
+"        if (init && init.redirect === 'manual') {",
+"          try { init.headers.set('x-fp-noredir', '1'); } catch (eNR) { /* ignore */ }",
+"        }",
 "        var iu = '';",
 "        try { iu = (typeof input === 'string') ? input : (input && typeof input.url === 'string') ? input.url : ''; } catch (eIU) { iu = ''; }",
 "        var meth = 'GET';",
@@ -2900,7 +2908,7 @@ async function handle(req, event) {
      * the query — strip it before going upstream. Token requests carry
      * their whole query INSIDE the token; any extra params the browser
      * appended (e.g. EventSource adding __t) are merged in, minus __t. */
-    const upUrl = new URL(upstream);
+    let upUrl = new URL(upstream);
     if (tokMode) {
       for (const [k, v] of url.searchParams) {
         if (k === '__t') continue;
@@ -2914,7 +2922,7 @@ async function handle(req, event) {
     const h = new Headers();
     const skipReq = new Set(['host', 'origin', 'referer', 'cookie', 'connection', 'keep-alive', 'upgrade',
       'proxy-connection', 'te', 'trailer', 'transfer-encoding', 'content-length', 'accept-encoding',
-      'x-cookie', 'x-proxy-token', 'x-set-cookie', 'x-fp-owner', 'x-fp-claim', 'sec-fetch-site', 'sec-fetch-storage-access']);
+      'x-cookie', 'x-proxy-token', 'x-set-cookie', 'x-fp-owner', 'x-fp-claim', 'x-fp-noredir', 'sec-fetch-site', 'sec-fetch-storage-access']);
     /* v7.3: sec-fetch-site is dropped from the forwarded set and stamped
      * as same-origin below. The pocket paints every page inside a
      * null-origin sandbox frame, so the browser labels EVERY proxied
@@ -3084,6 +3092,77 @@ async function handle(req, event) {
       return json({ error: 'upstream fetch failed', detail: String(err && err.message || err) }, req, 502);
     }
 
+    /* ---- v1.4: SERVER-SIDE REDIRECT WALKING ------------------------------
+     * Google's post-password hop is a redirect CHAIN: hop 1 (302) sets
+     * the signed-in session cookies (SID / HSID / SAPISID ...), hop 2
+     * already expects them. The old proxy returned every 3xx to the
+     * client (Location rewritten) and relied on the browser to follow
+     * — but sandbox fetches are credentials:'omit' (the session rides
+     * on x-cookie, which the network stack does NOT re-stamp on
+     * auto-followed hops), and the reissued browser cookies are
+     * third-party / partitioned, which Android Chrome refuses from a
+     * file:// pocket. The chain ran out of cookies mid-flight and
+     * Google answered the "cookies are disabled" page. The walk below
+     * is what a real browser with a live jar does, done inside the
+     * worker: collect every hop's Set-Cookie, fold it into the next
+     * hop's Cookie header, hand the client ONE final response carrying
+     * the whole collected wave (x-set-cookie + reissued cookies).
+     * Pass-through (the old 3xx-to-the-client behavior) only when the
+     * hop is not walkable: an off-allowlist host, a non-http scheme,
+     * the hop limit, a 307/308 whose streaming body cannot be
+     * replayed — or the client explicitly asked for redirect:'manual'
+     * (x-fp-noredir, set by the runtime patch for app code that wants
+     * to see the 3xx itself). */
+    const chainSc = []; /* every set-cookie seen across hops, in order */
+    if (!req.headers.get('x-fp-noredir')) {
+      try {
+        const MAX_HOPS = 10;
+        let hops = 0;
+        while (hops < MAX_HOPS) {
+          const stH = res.status;
+          let locH = '';
+          try { locH = res.headers.get('location') || ''; } catch (eLH) { locH = ''; }
+          if (!locH || stH < 300 || stH >= 400 || stH === 304) break;
+          let scH = [];
+          try { scH = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : []; } catch (eGH) { scH = []; }
+          scH.forEach((sc) => chainSc.push(sc));
+          let next = null;
+          try { next = new URL(locH, res.url || upUrl.toString()); } catch (eNU) { next = null; }
+          if (!next || !/^https?:$/.test(next.protocol)) break;      /* not walkable */
+          if (!hostAllowed(next.host, event)) break;                  /* off-family: pass the 3xx through */
+          const keepBody = (stH === 307 || stH === 308);
+          if (keepBody && needDuplex) break;                          /* streaming body: not replayable */
+          /* fold the wave collected so far into the next hop */
+          try {
+            const curCkH = h.get('cookie') || '';
+            const foldedH = mergeCookieList([curCkH], chainSc);
+            if (foldedH) h.set('cookie', foldedH); else h.delete('cookie');
+          } catch (eFh) { /* keep the header as it was */ }
+          /* redirect semantics: 303 (and de-facto 301/302) become GET —
+           * bodyless, headerless, exactly like a browser */
+          let mH = method;
+          if ((stH === 303 || stH === 301 || stH === 302) && method !== 'HEAD') mH = 'GET';
+          if (mH === 'GET' || mH === 'HEAD') {
+            try { h.delete('content-type'); } catch (eCT) { /* ignore */ }
+            try { h.delete('content-length'); } catch (eCL) { /* ignore */ }
+          } else if (body !== undefined && body !== null && typeof body === 'object' && typeof body.byteLength === 'number') {
+            try { h.set('content-length', String(body.byteLength)); } catch (eCL2) { /* ignore */ }
+          }
+          h.set('origin', 'https://' + next.host);
+          h.set('referer', 'https://' + next.host + '/');
+          const initH = { method: mH, headers: h, redirect: 'manual' };
+          if (mH !== 'GET' && mH !== 'HEAD' && body !== undefined) initH.body = body;
+          const resH = await fetch(next.toString(), initH);
+          try { if (res.body && res.body.cancel) res.body.cancel(); } catch (eCn) { /* ignore */ }
+          res = resH;
+          upUrl = new URL(next.toString());
+          host = next.host;
+          if (!tokMode) { try { pfx = prefixForHost(host, event); } catch (ePF) { /* keep */ } }
+          hops++;
+        }
+      } catch (eWalk) { /* pass the current response through untouched */ }
+    }
+
     /* ---- passive session capture (the relay keeps the sign-in).
      * Reads only response headers (set-cookie), plus a bounded clone
      * of small JSON bodies for the best-effort identity scan — the
@@ -3112,7 +3191,12 @@ async function handle(req, event) {
     let claimStamp = '';
     try {
       if (!isSignoutCall) {
-        const scAll = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [];
+        /* v1.4: the union — every set-cookie the walked chain handed
+         * out (in order) PLUS the final response's own wave. */
+        let scAll = chainSc.slice();
+        try {
+          if (typeof res.headers.getSetCookie === 'function') res.headers.getSetCookie().forEach((sc) => scAll.push(sc));
+        } catch (eGS) { /* ignore */ }
         /* the v7.2 rights pre-check: keyed mode (or key-carrying
          * owner) was decided above; a keyless sign-in wave may yet
          * claim (decided below, after the identity scan) */
@@ -3180,16 +3264,17 @@ async function handle(req, event) {
     if (loc && res.status >= 300 && res.status < 400 && res.status !== 304) {
       const mapped = mapLocation(loc, upUrl, event, tokMode);
       const rh = scrubHeaders(res.headers);
-      reissueCookies(res, rh, event);
+      reissueCookies(res, rh, event, chainSc); /* v1.4: hops already walked reissue here too */
       rh.set('location', mapped);
       maybeSetTokenCookie(req, rh, event);
+      if (claimStamp) rh.set('x-fp-claim', claimStamp); /* v1.4: a claim minted mid-chain must not be lost */
       return new Response(null, { status: res.status, headers: corsHeaders(req, rh) });
     }
 
     /* ---- normal responses ---- */
     const ct = (res.headers.get('content-type') || '').toLowerCase();
     const outHeaders = scrubHeaders(res.headers);
-    reissueCookies(res, outHeaders, event);
+    reissueCookies(res, outHeaders, event, chainSc); /* v1.4: the whole walked chain's wave */
     maybeSetTokenCookie(req, outHeaders, event);
     outHeaders.set('x-final-url', res.url || upUrl.toString());
     if (retried) outHeaders.set('x-fp-retry', '1');
@@ -3352,8 +3437,15 @@ function mergeCookies(a, b) {
       if (!seen.has(name)) seen.set(name, kv);
     });
   };
-  add(a); // browser-native cookies win
-  add(b); // patch-supplied fallback cookies fill gaps
+  /* v1.4: the x-cookie jar (b) wins — it is the freshest view of
+   * the session (it ingests every x-set-cookie wave, and the
+   * pocket's shell now rides it on document fetches too). Real
+   * browser cookies for the relay domain (a) are third-party /
+   * partitioned — Android Chrome routinely refuses them from a
+   * file:// pocket, and they can go stale — so they only fill
+   * gaps, never override. */
+  add(b);
+  add(a);
   return Array.from(seen.values()).join('; ');
 }
 
@@ -3391,7 +3483,7 @@ function scrubHeaders(headers) {
 }
 
 /* re-issue upstream cookies for this worker's domain (CHIPS-partitioned so they work in the app iframe) */
-function reissueCookies(res, h, event) {
+function reissueCookies(res, h, event, extraList) {
   try {
     let raw = [];
     if (typeof res.headers.getSetCookie === 'function') raw = res.headers.getSetCookie();
@@ -3399,6 +3491,11 @@ function reissueCookies(res, h, event) {
       const single = res.headers.get('set-cookie');
       if (single) raw = [single];
     }
+    /* v1.4: cookies collected from walked redirect hops ride along
+     * too — the browser jar AND the client JS jar (x-set-cookie)
+     * must catch up with the whole chain, in order, freshest
+     * last. */
+    (extraList || []).forEach((sc) => { raw.push(sc); });
     if (!raw.length) return;
     raw.forEach((sc) => {
       const parts = String(sc).split(';');
