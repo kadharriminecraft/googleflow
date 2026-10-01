@@ -26,11 +26,14 @@ const OWNER_KEY = "";
 
 /* ============================================================
  * flow pocket — Cloudflare Worker relay — worker.js
- * BUILD: fp service 1.4 (cookie-faithful hops: server-side
- *   redirect walking + the session jar on every document fetch
- *   — the post-password "cookies are disabled" wall is dead)
+ * BUILD: fp service 1.5 (sign in with your browser: /__signin
+ *   opens the Google sign-in in the phone's REAL browser through
+ *   the relay — the sandbox fingerprint Google's risk page refuses
+ *   is out of the loop, and the finished wave captures into the
+ *   slot the pocket holds the key for. Plus: /p/ top-level mode —
+ *   the runtime navigates for real when there is no shell above)
  *   Deploy check: /__status on the worker URL must answer
- *   "fp service 1.3" — anything else is an old copy; replace it
+ *   "fp service 1.5" — anything else is an old copy; replace it
  *   with this file.
  * ------------------------------------------------------------
  * WHAT THIS DOES (the "no-navigation" architecture, ported from
@@ -138,7 +141,7 @@ const OWNER_KEY = "";
  *     URL never rides your sign-in.
  * ============================================================ */
 
-const VERSION = 'fp service 1.4';
+const VERSION = 'fp service 1.5';
 
 /* Google first-party family (suffix match — covers subdomains).
  * Flow itself lives at flow.google.com; the .google gTLD (a
@@ -173,7 +176,7 @@ const ALLOW = [
  * with the runtime patch via window.__FLW__.key (build asserts the
  * template carries exactly one TOK_KEY definition). ?url= is NOT
  * accepted: tokens are the only way in. */
-const TOK_KEY_BASE = 'flowtok-1-0-3-Fq7wZx2Lm';
+const TOK_KEY_BASE = 'flowtok-1-0-5-aLSk2FVBTJ0';
 /* v7.4: keyed relays re-key the whole token space with a mask
  * derived from the OWNER_KEY (never the key itself — the mask rides
  * to the client as __FLW__.key exactly like TOK_KEY always has, and
@@ -362,6 +365,48 @@ const PATCH_JS = [
 "          upUrl = 'https://' + HOST + rp;",
 "        }",
 "      } catch (eU2) { /* keep upUrl */ }",
+"      /* v1.5: TOP-LEVEL MODE — no shell above us (the /__signin",
+"       * browser flow). Act on the nav HERE: navigate this tab for",
+"       * real to the mapped worker URL. GET/HEAD goes by location.href;",
+"       * a POST navigation is replayed with a synthesized form —",
+"       * urlencoded bodies field-by-field, anything else as one",
+"       * hidden field (best effort). */",
+"      if (!(window.parent && window.parent !== window)) {",
+"        try {",
+"          var tgt = absW(mapped) || mapped;",
+"          var mNav = String(method || 'GET').toUpperCase();",
+"          if (mNav === 'GET' || mNav === 'HEAD') {",
+"            location.href = tgt;",
+"          } else {",
+"            var fNav = document.createElement('form');",
+"            fNav.method = 'POST';",
+"            fNav.action = tgt;",
+"            var encNav = 'application/x-www-form-urlencoded';",
+"            if (ct && /multipart\\/form-data|text\\/plain/i.test(String(ct))) encNav = String(ct);",
+"            fNav.setAttribute('enctype', encNav);",
+"            if (body != null && body !== '') {",
+"              if (encNav === 'application/x-www-form-urlencoded') {",
+"                String(body).replace(/\\+/g, ' ').split('&').forEach(function (pN) {",
+"                  var eqN = pN.indexOf('=');",
+"                  if (eqN < 0) return;",
+"                  var iN = document.createElement('input');",
+"                  iN.type = 'hidden';",
+"                  try { iN.name = decodeURIComponent(pN.slice(0, eqN)); iN.value = decodeURIComponent(pN.slice(eqN + 1)); }",
+"                  catch (eDN) { iN.name = pN.slice(0, eqN); iN.value = pN.slice(eqN + 1); }",
+"                  fNav.appendChild(iN);",
+"                });",
+"              } else {",
+"                var tN = document.createElement('input');",
+"                tN.type = 'hidden'; tN.name = '_fpb'; tN.value = String(body);",
+"                fNav.appendChild(tN);",
+"              }",
+"            }",
+"            (document.body || document.documentElement).appendChild(fNav);",
+"            fNav.submit();",
+"          }",
+"          return s;",
+"        } catch (eNav) { /* fall through to the shell path */ }",
+"      }",
 "      up({ type: 'navreq', url: mapped, up: upUrl, method: method || 'GET', body: body || null, ct: ct || null });",
 "      return s;",
 "    } catch (e) { return u; }",
@@ -396,7 +441,12 @@ const PATCH_JS = [
 "    });",
 "    loc.assign = function (v) { nav(v); };",
 "    loc.replace = function (v) { nav(v); };",
-"    loc.reload = function () { up({ type: 'reloadreq' }); };",
+"    loc.reload = function () {",
+"      /* v1.5: top-level mode — reload the tab for real; the shell",
+"       * path (a parent exists) still asks the pocket to re-fetch. */",
+"      if (!(window.parent && window.parent !== window)) { try { location.reload(); return; } catch (eRl) { /* ignore */ } }",
+"      up({ type: 'reloadreq' });",
+"    };",
 "    loc.toString = function () { return LOC.u ? LOC.u.href : (DOC || 'about:srcdoc'); };",
 "    ['origin', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash'].forEach(function (k) {",
 "      try {",
@@ -411,7 +461,8 @@ const PATCH_JS = [
 "    });",
 "    return loc;",
 "  }",
-"  if (SD) {",
+"  /* v1.5: install the fake location whenever the document's upstream URL is known — sandbox (SD) AND top-level (/p/ and tokenized tabs) modes alike, because the served bundles read __flwLoc tokens either way. */",
+"  if (SD || DOC) {",
 "    try { window.__flwLoc = makeLoc(); } catch (eL) { /* ignore */ }",
 "    /* v1.2 sign-in fix: arbitrary-receiver location reads. Google's",
 "     * Glif sign-in bundles wrap the window in services and read",
@@ -482,6 +533,18 @@ const PATCH_JS = [
 "        }",
 "      }",
 "  } catch (eN) { /* ignore */ }",
+"",
+"  /* ---------- v1.5: top-level mode — the owner key from the",
+"   * fp-bk cookie the /__signin begin-page set on this relay's own",
+"   * domain (first-party, readable here). Lets the browser sign-in",
+"   * flow's wrapped requests carry x-fp-owner exactly like the",
+"   * pocket shell's do. */",
+"  if (!OKEY) {",
+"    try {",
+"      var mBk = String(document.cookie || '').match(/(?:^|;\\s*)fp-bk=([^;]+)/);",
+"      if (mBk) OKEY = decodeURIComponent(mBk[1]);",
+"    } catch (eBk) { /* ignore */ }",
+"  }",
 "",
 "  /* ---------- messaging ---------- */",
 "  function up(msg) {",
@@ -2237,16 +2300,39 @@ function ownerKeyOf(event) {
   const env = envOf(event) || {};
   return String(OWNER_KEY || env.OWNER_KEY || env.FP_OWNER_KEY || '').trim();
 }
+/* v1.5: the shared key compare (sha-256 on both sides — never a
+ * raw string compare), used by every key gate below and by
+ * /__signin's ?k= check. */
+async function fpKeyEq(want, got) {
+  try {
+    const a = await sha256Hex('fp-owner-v1|' + String(want));
+    const b = await sha256Hex('fp-owner-v1|' + String(got));
+    return a === b;
+  } catch (eKK) { return false; }
+}
+
+/* v1.5: where a request's owner key comes from. The pocket shell
+ * sends x-fp-owner as a header; the top-level browser sign-in
+ * cannot set headers on its navigations, so /__signin stamps the
+ * key as the fp-bk cookie on the relay's own domain and it rides
+ * along first-party instead. Header first, cookie as fallback. */
+function ownerKeyFromReq(req) {
+  try {
+    const h = String(req.headers.get('x-fp-owner') || '').trim();
+    if (h) return h;
+    const ck = String(req.headers.get('cookie') || '');
+    const m = ck.match(/(?:^|;\s*)fp-bk=([^;]+)/);
+    if (m) return decodeURIComponent(m[1]).trim();
+  } catch (eOF) { /* ignore */ }
+  return '';
+}
+
 async function ownerKeyOk(req, event) {
   const want = ownerKeyOf(event);
   if (!want) return false;
-  const got = String(req.headers.get('x-fp-owner') || '').trim();
+  const got = ownerKeyFromReq(req);
   if (!got) return false;
-  try {
-    const a = await sha256Hex('fp-owner-v1|' + want);
-    const b = await sha256Hex('fp-owner-v1|' + got);
-    return a === b;
-  } catch (eK) { return false; }
+  return fpKeyEq(want, got);
 }
 
 /* ---- v7.2: AUTO mode — the relay locks itself to the first account
@@ -2277,13 +2363,9 @@ function newSlotKey() {
 async function slotKeyOk(req, st) {
   const want = String((st && st.key) || '').trim();
   if (!want) return false;
-  const got = String(req.headers.get('x-fp-owner') || '').trim();
+  const got = ownerKeyFromReq(req);
   if (!got) return false;
-  try {
-    const a = await sha256Hex('fp-owner-v1|' + want);
-    const b = await sha256Hex('fp-owner-v1|' + got);
-    return a === b;
-  } catch (eSK) { return false; }
+  return fpKeyEq(want, got);
 }
 
 async function sessionRead(req) {
@@ -2491,6 +2573,82 @@ async function sessionCapture(req, setCookieList, idObj, opts) {
 
 /* the endpoint: GET / DELETE (POST is intentionally absent — the
  * capture path is the only writer; the pocket never uploads) */
+/* v1.5: the sign-in upstream — overridable for local E2E only */
+function signinUpstream(event) { return envOf(event).SIGNIN_UPSTREAM || 'https://accounts.google.com'; }
+function signinHost(event) {
+  try { return new URL(signinUpstream(event)).host; } catch (eSH) { return 'accounts.google.com'; }
+}
+
+/* a tiny neutral page (worker-origin content must never look like
+ * anything classifiable) */
+function signinNeutralPage(title, body, status) {
+  return new Response(
+    '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + title + '</title></head>' +
+    '<body style="margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#20232F;color:#E7E9EE;font:15px/1.6 -apple-system,BlinkMacSystemFont,system-ui,Segoe UI,Roboto,sans-serif">' +
+    '<div style="max-width:560px;padding:32px;text-align:center">' + body + '</div></body></html>',
+    { status: status || 200, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
+}
+
+/* ---- v1.5: /__signin — "Sign in with your browser" -------------------
+ * The in-app sign-in can end on Google's risk page ("This browser
+ * or app may not be secure") because the sandboxed app frame is,
+ * honestly, an odd environment for gaia — and every retry there
+ * only raises the risk score. This endpoint is the way around it:
+ * the pocket opens WORKER/__signin?k=<key> in the phone's REAL
+ * browser — a genuine top-level Chrome, exactly what Google's
+ * "try another browser" advice asks for. The worker validates (or
+ * binds) the pocket's key, stamps it as the fp-bk cookie on the
+ * relay's own domain (first-party for the whole flow, 2 hours),
+ * and redirects into the /p/ path-preserving sign-in chain. Every
+ * request of the flow then carries fp-bk — the worker reads it as
+ * the owner key (ownerKeyFromReq), so the finished sign-in wave
+ * captures with owner rights straight into the slot this pocket
+ * holds the key for. Back in the pocket: the session row (or
+ * "Check again") picks it up — no cookie export, no pasting. */
+async function handleSignin(req, url, event) {
+  if (!sessionRateOk(req)) {
+    return json({ ok: false, error: 'too many requests — wait two minutes and try again' }, req, 429);
+  }
+  const k = String(url.searchParams.get('k') || '').trim();
+  if (!k || k.length < 16 || k.length > 200 || !/^[\x21-\x7e]+$/.test(k)) {
+    return signinNeutralPage('Flow Pocket',
+      'This page is the pocket\u2019s <b>browser sign-in</b>.<br>Open <b>flow-pocket.html</b> on your phone and tap <b>\u201cSign in with your browser\u2026\u201d</b> \u2014 it opens this page with your key.');
+  }
+  const master = ownerKeyOf(event);
+  if (master) {
+    if (!(await fpKeyEq(master, k))) {
+      return signinNeutralPage('Flow Pocket',
+        '<b>This relay is keyed.</b><br>The link\u2019s key does not match its OWNER_KEY \u2014 open the pocket, put the same key in the OWNER_KEY box, then try again.', 403);
+    }
+  } else {
+    const st = await sessionRead(req);
+    const hasKey = !!st.key;
+    const hasJar = !!(st.jar && Object.keys(st.jar).length);
+    if ((hasKey || hasJar) && st.key !== k) {
+      if (jarHasGoogleUser(st.jar)) {
+        return signinNeutralPage('Flow Pocket',
+          '<b>This relay\u2019s session is locked to another device</b> \u2014 it already holds that device\u2019s key and a live sign-in.<br>On the pocket that owns it, tap <b>Forget</b>; or set the <b>OWNER_KEY</b> const in worker.js to unlock it with the master key.', 403);
+      }
+      /* no live session held: nothing to protect — rebind below.
+       * (Covers a key bound by an earlier browser sign-in that never
+       * finished, an expired sign-in, or a pocket that re-minted.) */
+    }
+    if (st.key !== k) {
+      st.key = k;
+      await sessionWrite(req, st);
+    }
+  }
+  const cont = flowUpstream(event) + '/';
+  const dest = '/p/' + signinHost(event) + '/ServiceLogin?continue=' + encodeURIComponent(cont) + '&flowName=GlifWebSignIn';
+  const h = new Headers({
+    'content-type': 'text/html; charset=utf-8',
+    'cache-control': 'no-store',
+    'location': dest,
+  });
+  h.append('set-cookie', 'fp-bk=' + encodeURIComponent(k) + '; Path=/; Secure; SameSite=Lax; Max-Age=7200');
+  return new Response('<!DOCTYPE html><html><body>Opening the sign-in\u2026</body></html>', { status: 302, headers: corsHeaders(req, h) });
+}
+
 async function handleSession(req, url, event) {
   const method = req.method.toUpperCase();
   if (!sessionRateOk(req)) {
@@ -2718,6 +2876,17 @@ async function handle(req, event) {
      * a mask derived from the OWNER_KEY (see TOK_KEY above), so no
      * pre-key or foreign token decodes: the lock has no side door. */
     if (ownerKeyOf(event) && !(await ownerKeyOk(req, event))) {
+      /* v1.5: /__signin may carry its key in the query (?k=) — a
+       * top-level browser navigation cannot set headers on its
+       * first hop. Same sha compare as every other key check. */
+      let signinOkV15 = false;
+      if (url.pathname === '/__signin') {
+        try {
+          const kV15 = String(url.searchParams.get('k') || '').trim();
+          signinOkV15 = !!(kV15 && (await fpKeyEq(ownerKeyOf(event), kV15)));
+        } catch (eV15) { signinOkV15 = false; }
+      }
+      if (!signinOkV15) {
       const lockP = url.pathname;
       if (lockP === '/__status') {
         return json({ ok: true, name: VERSION, time: new Date().toISOString(), session: true, session_mode: 'keyed', locked: true }, req);
@@ -2739,6 +2908,7 @@ async function handle(req, event) {
       }
       if (!tokOk) {
         return json({ ok: false, mode: 'keyed', error: 'locked — this relay answers only to its owner key' }, req, 403);
+      }
       }
     }
 
@@ -2777,6 +2947,11 @@ async function handle(req, event) {
      * a blocked page", this page tells the user WHY. */
     if (url.pathname === '/__diag') {
       return diagPage(req, event);
+    }
+
+    /* ---- v1.5: /__signin — the top-level browser sign-in entry ---- */
+    if (url.pathname === '/__signin') {
+      return handleSignin(req, url, event);
     }
 
     /* ---- v6.9: the relay-held session (single user, no secrets) ---- */
@@ -3252,8 +3427,20 @@ async function handle(req, event) {
         }
         if (capOk && (scAll.length || scanHint)) {
           const pCap = sessionCapture(req, scAll, scanHint, claimKey ? { claimKey: claimKey } : null);
-          if (event && typeof event.waitUntil === 'function') { try { event.waitUntil(pCap); } catch (eWu) { pCap.catch(function () { }); } }
-          else pCap.catch(function () { });
+          /* v1.5: a set-cookie WAVE is captured INLINE (awaited) — the
+           * sign-in moment must never depend on a background task that
+           * runs after the answer is already gone (dev runtimes were
+           * seen stalling waitUntil cache ops mid-session; inline costs
+           * a few ms on the one request that matters and makes the
+           * capture deterministic everywhere). Pure identity scans (no
+           * cookies) stay waitUntil — they are cosmetic. */
+          if (scAll.length) {
+            try { await pCap; } catch (eAw) { /* capture is best-effort */ }
+          } else if (event && typeof event.waitUntil === 'function') {
+            try { event.waitUntil(pCap); } catch (eWu) { pCap.catch(function () { }); }
+          } else {
+            pCap.catch(function () { });
+          }
           if (claimKey) claimStamp = claimKey;
         }
       }
@@ -3295,8 +3482,21 @@ async function handle(req, event) {
 
     if (ct.includes('text/html')) {
       const text = await res.text();
+      /* v1.5: the document's upstream URL is ALWAYS known — token
+       * mode decodes it from the token, /p/ mode carries it in the
+       * path. It feeds the runtime's fake location (SPA hydration,
+       * baseURI reads) in BOTH modes. */
+      const docUrlV15 = tokMode ? upUrl.toString() : ('https://' + host + upUrl.pathname + upUrl.search);
+      /* v1.5: SD (sandbox mode) is now SHELL-gated, not token-gated.
+       * The pocket shell fetches documents with fetch() — the browser
+       * says sec-fetch-mode: cors. A top-level browser navigation
+       * (the /__signin flow) says sec-fetch-mode: navigate and boots
+       * in TOP-LEVEL mode instead: native first-party cookies, real
+       * navigations. Old pockets / no header = sandbox mode, exactly
+       * as before. */
+      const navModeV15 = String(req.headers.get('sec-fetch-mode') || '').toLowerCase() === 'navigate';
       const html = rewriteHtml(text, pfx, host, new URL(req.url).origin, token, allowList(event),
-        tokMode ? upUrl.toString() : null);
+        tokMode ? upUrl.toString() : null, docUrlV15, tokMode && !navModeV15);
       const htmlRes = new Response(html, { status: res.status, headers: outCt });
       /* ---- v6.7: boot cookie-seed ---------------------------------------
        * When the pocket's document fetch arrived with REAL browser
@@ -3426,7 +3626,7 @@ function mergeCookies(a, b) {
   /* this worker's OWN cookies never belong upstream — __flw_t is
    * the token cookie (PROXY_TOKEN mode); it lives on the relay
    * origin only and must not ride to Google. */
-  const own = new Set(['__flw_t']);
+  const own = new Set(['__flw_t', 'fp-bk']); /* v1.5: fp-bk is the /__signin owner-key cookie — relay-local, never upstream */
   const add = (str) => {
     if (!str) return;
     str.split(';').forEach((kv) => {
@@ -3799,7 +3999,7 @@ function mapAttr(v, pfx, host, allow, tokDoc, workerOrigin) {
 
 const ATTR_NAMES = 'href|src|action|formaction|poster|data-src|data-href|data-url|data-background';
 
-function rewriteHtml(text, pfx, host, workerOrigin, token, allow, tokDoc) {
+function rewriteHtml(text, pfx, host, workerOrigin, token, allow, tokDoc, docUrl, sdFlag) {
   try {
     /* strip CSP meta tags and base targets */
     text = text.replace(/<meta[^>]+http-equiv\s*=\s*["']?content-security-policy["']?[^>]*>/gi, '');
@@ -3905,7 +4105,8 @@ function rewriteHtml(text, pfx, host, workerOrigin, token, allow, tokDoc) {
      * path-preserved. The runtime's document.baseURI override still
      * reports the upstream URL to the app, so routers hydrate right. */
     const cfg = { pfx: pfx, host: host, worker: workerOrigin, token: token || '', allow: allow,
-      key: TOK_KEY, tok: !!tokDoc, doc: tokDoc || '', sd: !!tokDoc };
+      key: TOK_KEY, tok: !!tokDoc, doc: docUrl || tokDoc || '',
+      sd: (sdFlag === undefined || sdFlag === null) ? !!tokDoc : !!sdFlag }; /* v1.5: doc known in both modes; sd is shell-gated */
     let inject = '<scr' + 'ipt>window.__FLW__=' + JSON.stringify(cfg) + ';' + PATCH_JS + '</scr' + 'ipt>';
     if (tokDoc) {
       try {
