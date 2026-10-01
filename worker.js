@@ -26,14 +26,16 @@ const OWNER_KEY = "";
 
 /* ============================================================
  * flow pocket — Cloudflare Worker relay — worker.js
- * BUILD: fp service 1.5 (sign in with your browser: /__signin
- *   opens the Google sign-in in the phone's REAL browser through
- *   the relay — the sandbox fingerprint Google's risk page refuses
- *   is out of the loop, and the finished wave captures into the
- *   slot the pocket holds the key for. Plus: /p/ top-level mode —
- *   the runtime navigates for real when there is no shell above)
+ * BUILD: fp service 1.6 (the rejected-page pivot: when Google's
+ *   risk engine answers a sign-in with the /v3/signin/rejected
+ *   page — "this browser or app may not be secure" — the relay
+ *   now (a) stamps x-fp-rejected on that document so the pocket
+ *   pivots the user to the browser sign-in route, and (b) in the
+ *   top-level /__signin tab injects the wait-and-retry strip onto
+ *   Google's dead-end page itself. Plus everything 1.5 shipped:
+ *   sign in with your browser (/__signin), /p/ top-level mode)
  *   Deploy check: /__status on the worker URL must answer
- *   "fp service 1.5" — anything else is an old copy; replace it
+ *   "fp service 1.6" — anything else is an old copy; replace it
  *   with this file.
  * ------------------------------------------------------------
  * WHAT THIS DOES (the "no-navigation" architecture, ported from
@@ -141,7 +143,7 @@ const OWNER_KEY = "";
  *     URL never rides your sign-in.
  * ============================================================ */
 
-const VERSION = 'fp service 1.5';
+const VERSION = 'fp service 1.6';
 
 /* Google first-party family (suffix match — covers subdomains).
  * Flow itself lives at flow.google.com; the .google gTLD (a
@@ -3495,8 +3497,34 @@ async function handle(req, event) {
        * navigations. Old pockets / no header = sandbox mode, exactly
        * as before. */
       const navModeV15 = String(req.headers.get('sec-fetch-mode') || '').toLowerCase() === 'navigate';
-      const html = rewriteHtml(text, pfx, host, new URL(req.url).origin, token, allowList(event),
+      /* v1.6: REJECTED-PAGE DETECTION. Google's risk engine ends a
+       * sign-in it dislikes with the /v3/signin/rejected document
+       * ("This browser or app may not be secure"). Two answers:
+       * the response is flagged x-fp-rejected:1 so the pocket's
+       * shell can pivot the user to the browser sign-in route, and
+       * in TOP-LEVEL mode (the /__signin tab — the user is alone
+       * in a browser with Google's dead end) a fixed strip with
+       * the honest guidance rides on top of the page. URL shape
+       * first, then the literal page phrase as the variant-proof
+       * fallback (it is server-rendered text, not a bundle). */
+      let rejV16 = false;
+      try {
+        rejV16 = /\/signin\/(rejected|blocked)/i.test(docUrlV15) ||
+          /\/signin\/(rejected|blocked)/i.test(res.url || '') ||
+          text.indexOf('This browser or app may not be secure') > -1;
+      } catch (eRej) { rejV16 = false; }
+      let html = rewriteHtml(text, pfx, host, new URL(req.url).origin, token, allowList(event),
         tokMode ? upUrl.toString() : null, docUrlV15, tokMode && !navModeV15);
+      if (rejV16) {
+        outCt.set('x-fp-rejected', '1');
+        if (navModeV15) {
+          /* script-free strip — inline styles only, works under any CSP */
+          const barV16 = '<div id="fp-rejbar" style="position:fixed;top:0;left:0;right:0;z-index:2147483647;box-sizing:border-box;padding:10px 14px;font:13px/1.45 Roboto,Arial,sans-serif;background:#1a73e8;color:#fff;text-align:center">' +
+            '<b>Flow Pocket</b> · Google\u2019s security check paused this sign-in for now. This clears on its own — <b>wait about 15 minutes</b> (up to an hour), then open <b>\u201cSign in with your browser\u2026\u201d</b> in Flow Pocket and try again. Retrying right away makes it stricter. Still refused after waiting? Use <b>\u201cImport sign-in from Chrome\u2026\u201d</b> in Flow Pocket instead.</div>';
+          if (/<body\b[^>]*>/i.test(html)) html = html.replace(/<body\b[^>]*>/i, function (mB) { return mB + barV16; });
+          else html = barV16 + html;
+        }
+      }
       const htmlRes = new Response(html, { status: res.status, headers: outCt });
       /* ---- v6.7: boot cookie-seed ---------------------------------------
        * When the pocket's document fetch arrived with REAL browser
@@ -3750,7 +3778,7 @@ function corsHeaders(req, h) {
   h.set('access-control-allow-methods', 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS');
   const reqH = req.headers.get('access-control-request-headers');
   h.set('access-control-allow-headers', reqH || '*');
-  h.set('access-control-expose-headers', 'content-disposition, content-type, x-set-cookie, x-final-url, filename, x-fp-retry, x-fp-jsrw, x-jar-seed, x-fp-claim');
+  h.set('access-control-expose-headers', 'content-disposition, content-type, x-set-cookie, x-final-url, filename, x-fp-retry, x-fp-jsrw, x-jar-seed, x-fp-claim, x-fp-rejected');
   h.set('access-control-max-age', '86400');
   return h;
 }
