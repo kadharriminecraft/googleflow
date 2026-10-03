@@ -26,16 +26,19 @@ const OWNER_KEY = "";
 
 /* ============================================================
  * flow pocket — Cloudflare Worker relay — worker.js
- * BUILD: fp service 1.6 (the rejected-page pivot: when Google's
- *   risk engine answers a sign-in with the /v3/signin/rejected
- *   page — "this browser or app may not be secure" — the relay
- *   now (a) stamps x-fp-rejected on that document so the pocket
- *   pivots the user to the browser sign-in route, and (b) in the
- *   top-level /__signin tab injects the wait-and-retry strip onto
- *   Google's dead-end page itself. Plus everything 1.5 shipped:
- *   sign in with your browser (/__signin), /p/ top-level mode)
+ * BUILD: fp service 1.7 (the hidden tab: the browser sign-in now
+ *   runs on OPAQUE /__t/ tokens — the 1.5 form navigated the tab to
+ *   /p/accounts.google.com/… and a readable google hostname in the
+ *   request PATH is exactly what organization filters key on, so on
+ *   filtered networks the tab died at its first hop. Also new:
+ *   /__helper, a relay-hosted sign-in helper page that works in any
+ *   browser (status check + cookie import); document navigations
+ *   that try to leave the allowlist get a neutral interstitial
+ *   instead of a stranded raw redirect; the rejected-page strip
+ *   carries working links. Plus everything 1.6/1.5 shipped: the
+ *   rejected-page pivot, sign in with your browser (/__signin).)
  *   Deploy check: /__status on the worker URL must answer
- *   "fp service 1.6" — anything else is an old copy; replace it
+ *   "fp service 1.7" — anything else is an old copy; replace it
  *   with this file.
  * ------------------------------------------------------------
  * WHAT THIS DOES (the "no-navigation" architecture, ported from
@@ -143,7 +146,7 @@ const OWNER_KEY = "";
  *     URL never rides your sign-in.
  * ============================================================ */
 
-const VERSION = 'fp service 1.6';
+const VERSION = 'fp service 1.7';
 
 /* Google first-party family (suffix match — covers subdomains).
  * Flow itself lives at flow.google.com; the .google gTLD (a
@@ -2591,6 +2594,125 @@ function signinNeutralPage(title, body, status) {
     { status: status || 200, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
 }
 
+/* ---- v1.7: the escape interstitial -----------------------------------
+ * A document navigation whose redirect chain tries to leave the
+ * allowlist would otherwise receive a raw 3xx to an upstream URL —
+ * one the phone network may refuse outright (that is why the relay
+ * exists). Serve this neutral page instead: honest about what
+ * happened, one tap back into the app, the raw link still offered
+ * for the rare case where the network can in fact reach it. */
+function escapePageV17(target, req) {
+  const tV17 = String(target || '').replace(/[&<>"]/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+  });
+  const htmlV17 = '<!DOCTYPE html><html><head><meta charset="utf-8">' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Flow Pocket</title></head>' +
+    '<body style="margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;font:14px/1.6 Roboto,Arial,sans-serif;background:#101318;color:#e8eaed">' +
+    '<div style="max-width:520px;padding:28px;background:#171b22;border:1px solid #2a3040;border-radius:14px">' +
+    '<div style="font-size:17px;font-weight:600;margin-bottom:10px">That page tried to leave the relay</div>' +
+    '<div style="color:#9aa4b2">The page you were on wanted to open <b style="color:#e8eaed">' + tV17 + '</b> outside the relay. ' +
+    'On a filtered network that address will not load directly — that is exactly why everything here stays inside. The app itself keeps working.</div>' +
+    '<div style="margin-top:18px"><a href="/" style="display:inline-block;padding:10px 16px;background:#1a73e8;color:#fff;border-radius:9px;text-decoration:none;font-weight:600">Back to Flow</a>' +
+    ' &nbsp; <a href="' + tV17 + '" style="color:#8ab4f8">Open it directly anyway</a></div>' +
+    '</div></body></html>';
+  const hV17 = new Headers({ 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+  return new Response(htmlV17, { status: 200, headers: corsHeaders(req, hV17) });
+}
+
+/* ---- v1.7: /__helper — the sign-in helper page ------------------------
+ * A relay-hosted page that works in ANY browser (phone Chrome, a
+ * computer, an extension browser): it shows whether the relay holds
+ * a session and imports a sign-in pasted from a browser that is
+ * signed in. The pocket links here with ?k=<key>; a /__signin tab
+ * visit leaves the fp-bk cookie this page auto-reads; a bare visit
+ * asks for the key. The import is the very same PUT /__session the
+ * pocket uses — same parser, same validation, same claim minting,
+ * so anything that pastes fine in the pocket pastes fine here.
+ * NOTE: this source is embedded in the pocket island, so the page
+ * string must never contain a literal script-closing tag — it
+ * rides escaped (backslash-prefixed) and regex backslashes are
+ * doubled. */
+function helperPageV17(req) {
+  const htmlV17 = '<!DOCTYPE html><html><head><meta charset="utf-8">' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<title>Flow sign-in helper</title>' +
+    '<style>' +
+    'body{margin:0;background:#101318;color:#e8eaed;font:14px/1.6 Roboto,system-ui,Arial,sans-serif;padding:20px 14px 60px}' +
+    'main{max-width:640px;margin:0 auto}h1{font-size:22px;margin:0 0 4px}h2{font-size:16px;margin:26px 0 8px}' +
+    '.sub{color:#9aa4b2;margin:0 0 6px}' +
+    'input,textarea{width:100%;box-sizing:border-box;background:#171b22;color:#e8eaed;border:1px solid #2a3040;border-radius:10px;padding:10px;font:13px/1.5 ui-monospace,Menlo,monospace;margin:6px 0 10px}' +
+    'textarea{min-height:110px;resize:vertical}button{background:#1a73e8;color:#fff;border:0;border-radius:9px;padding:11px 18px;font:600 14px Roboto,Arial,sans-serif;cursor:pointer}' +
+    'a{color:#8ab4f8}ol,ul{margin:8px 0;padding-left:22px}li{margin:6px 0}' +
+    '.mut{color:#9aa4b2}.out{margin-top:12px;word-break:break-all}code{background:#171b22;padding:2px 6px;border-radius:6px;user-select:all}' +
+    '</style></head><body><main>' +
+    '<h1>Flow &middot; sign-in helper</h1>' +
+    '<p class="sub">This page lives on your relay. It brings a Google sign-in from <b>any browser</b> into the pocket &mdash; no app, no files. Bookmark it: the address never changes.</p>' +
+    '<h2>Relay key</h2>' +
+    '<p class="sub">The pocket fills this in automatically when it opens this page. By hand: it is the <code>fp-auto-&hellip;</code> key from your pocket (or your OWNER_KEY).</p>' +
+    '<input id="k" placeholder="fp-auto-... (usually filled in for you)" autocomplete="off" autocapitalize="off" spellcheck="false">' +
+    '<p><button id="stgo">Check the relay</button> <span class="mut" id="st"></span></p>' +
+    '<h2>Import a sign-in</h2>' +
+    '<ol>' +
+    '<li>On a browser that <b>is signed in to Google</b>, export its Google cookies:' +
+    '<ul>' +
+    '<li><b>Computer Chrome / Edge / Firefox</b> &mdash; install the free <b>Cookie-Editor</b> extension, open <b>google.com</b>, click its icon, <b>Export &rarr; JSON</b>. The clipboard holds everything.</li>' +
+    '<li><b>Android</b> &mdash; a Chromium browser that runs extensions (Kiwi, Lemur) runs the same Cookie-Editor extension the same way.</li>' +
+    '<li><b>No extensions</b> &mdash; DevTools (F12) &rarr; Application &rarr; Cookies &rarr; accounts.google.com: copy the rows (name and value), paste below.</li>' +
+    '</ul></li>' +
+    '<li>Paste them below and tap <b>Import</b>.</li>' +
+    '<li>Open Flow Pocket on the phone &mdash; it boots signed in.</li>' +
+    '</ol>' +
+    '<textarea id="paste" placeholder="Cookie-Editor JSON, a cookies.txt export, devtools rows, or a raw SID=...; HSID=... header — all paste fine"></textarea>' +
+    '<p><button id="go">Import</button></p>' +
+    '<div class="out mut" id="out"></div>' +
+    '<p class="sub">Rather sign in live? <a href="/__signin">Open the browser sign-in tab</a> (add ?k=your-key to the address if it asks for one).</p>' +
+    '</main>' +
+    '<script>' +
+    '(function () {' +
+    '  var K = "";' +
+    '  try { var m = document.cookie.match(/(?:^|;\\s*)fp-bk=([^;]+)/); if (m) K = decodeURIComponent(m[1]); } catch (e) {}' +
+    '  try { var q = new URLSearchParams(location.search).get("k"); if (q) K = q; } catch (e) {}' +
+    '  try { if (!K) K = localStorage.getItem("fp_helper_key") || ""; } catch (e) {}' +
+    '  var kEl = document.getElementById("k");' +
+    '  if (K) kEl.value = K;' +
+    '  function el(i) { return document.getElementById(i); }' +
+    '  function key() { K = kEl.value.trim(); try { localStorage.setItem("fp_helper_key", K); } catch (e) {} return K; }' +
+    '  function hdr() { var h = {}; if (key()) h["x-fp-owner"] = K; return h; }' +
+    '  el("stgo").onclick = function () {' +
+    '    var st = el("st"); st.textContent = "Checking...";' +
+    '    fetch("/__session", { headers: hdr() }).then(function (r) {' +
+    '      return r.json().catch(function () { return { ok: false, error: "HTTP " + r.status }; });' +
+    '    }).then(function (j) {' +
+    '      if (j.ok && j.has) st.innerHTML = "<b style=&quot;color:#81c995&quot;>A sign-in is held</b>" + (j.email ? (" &mdash; " + j.email) : "") + (j.savedAt ? (" (saved " + new Date(j.savedAt).toLocaleString() + ")") : "") + ".";' +
+    '      else if (j.ok && j.unclaimed) st.textContent = "This relay holds no sign-in yet.";' +
+    '      else if (j.locked) st.textContent = "Locked to another device — use the key from that device, or tap Forget there.";' +
+    '      else st.textContent = j.error || "No session held.";' +
+    '    }).catch(function () { st.textContent = "Network error — is this the right relay?"; });' +
+    '  };' +
+    '  el("go").onclick = function () {' +
+    '    var out = el("out"), v = el("paste").value;' +
+    '    if (!v.trim()) { out.textContent = "Paste the cookies first."; return; }' +
+    '    out.textContent = "Importing...";' +
+    '    fetch("/__session", { method: "PUT", headers: hdr(), body: v }).then(function (r) {' +
+    '      return r.json().catch(function () { return { ok: false, error: "HTTP " + r.status }; });' +
+    '    }).then(function (j) {' +
+    '      if (j.ok) {' +
+    '        out.innerHTML = "<b style=&quot;color:#81c995&quot;>Imported " + (j.imported || 0) + " cookies.</b> Open Flow Pocket on the phone — it is signed in now.";' +
+    '        if (j.claim) {' +
+    '          out.innerHTML += "<br><br><b>Save your relay key:</b> <code>" + j.claim + "</code><br>Type it once in Flow Pocket (the OWNER_KEY box) so the pocket can open the session.";' +
+    '          try { localStorage.setItem("fp_helper_key", j.claim); } catch (e) {}' +
+    '        }' +
+    '      } else {' +
+    '        out.innerHTML = "<b style=&quot;color:#f28b82&quot;>" + (j.error || "Not imported") + "</b>" + (j.saw && j.saw.length ? "<br>Saw: " + j.saw.join(", ") : "");' +
+    '      }' +
+    '    }).catch(function () { out.textContent = "Network error — is this the right relay?"; });' +
+    '  };' +
+    '})();' +
+    '<\/script></body></html>';
+  const hV17 = new Headers({ 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+  return new Response(htmlV17, { status: 200, headers: corsHeaders(req, hV17) });
+}
+
 /* ---- v1.5: /__signin — "Sign in with your browser" -------------------
  * The in-app sign-in can end on Google's risk page ("This browser
  * or app may not be secure") because the sandboxed app frame is,
@@ -2601,7 +2723,13 @@ function signinNeutralPage(title, body, status) {
  * "try another browser" advice asks for. The worker validates (or
  * binds) the pocket's key, stamps it as the fp-bk cookie on the
  * relay's own domain (first-party for the whole flow, 2 hours),
- * and redirects into the /p/ path-preserving sign-in chain. Every
+ * and redirects into an OPAQUE /__t/ token of the ServiceLogin
+ * chain (v1.7: the old /p/<host>/… form put a readable google
+ * hostname in the tab's request PATH — the one thing organization
+ * filters key on — so on filtered networks the tab died at its
+ * first hop; the token form keeps the tab's paths as unreadable as
+ * the app's, while the walk, the wave capture and top-level mode
+ * behave exactly as before). Every
  * request of the flow then carries fp-bk — the worker reads it as
  * the owner key (ownerKeyFromReq), so the finished sign-in wave
  * captures with owner rights straight into the slot this pocket
@@ -2641,7 +2769,14 @@ async function handleSignin(req, url, event) {
     }
   }
   const cont = flowUpstream(event) + '/';
-  const dest = '/p/' + signinHost(event) + '/ServiceLogin?continue=' + encodeURIComponent(cont) + '&flowName=GlifWebSignIn';
+  /* v1.7: OPAQUE ENTRY. tokPath() encrypts the whole ServiceLogin
+   * URL (host + path + the continue param) into /__t/<token> — no
+   * readable google hostname anywhere in the tab's request paths,
+   * exactly like the app. The /p/ form below is only an encoding-
+   * failure fallback and is never expected to run. */
+  const suV17 = signinUpstream(event) + '/ServiceLogin?continue=' + encodeURIComponent(cont) + '&flowName=GlifWebSignIn';
+  const dest = tokPath(suV17) ||
+    ('/p/' + signinHost(event) + '/ServiceLogin?continue=' + encodeURIComponent(cont) + '&flowName=GlifWebSignIn');
   const h = new Headers({
     'content-type': 'text/html; charset=utf-8',
     'cache-control': 'no-store',
@@ -2882,7 +3017,12 @@ async function handle(req, event) {
        * top-level browser navigation cannot set headers on its
        * first hop. Same sha compare as every other key check. */
       let signinOkV15 = false;
-      if (url.pathname === '/__signin') {
+      if (url.pathname === '/__helper' && req.method === 'GET') {
+        /* v1.7: the helper shell is neutral (its API calls carry the
+         * key and pass the gate like everything else) — same idea as
+         * /__status answering a locked stub. */
+        signinOkV15 = true;
+      } else if (url.pathname === '/__signin') {
         try {
           const kV15 = String(url.searchParams.get('k') || '').trim();
           signinOkV15 = !!(kV15 && (await fpKeyEq(ownerKeyOf(event), kV15)));
@@ -2954,6 +3094,14 @@ async function handle(req, event) {
     /* ---- v1.5: /__signin — the top-level browser sign-in entry ---- */
     if (url.pathname === '/__signin') {
       return handleSignin(req, url, event);
+    }
+
+    /* ---- v1.7: /__helper — the sign-in helper page (any browser) ---- */
+    if (url.pathname === '/__helper') {
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        return json({ ok: false, error: 'GET only — the import itself is a PUT /__session' }, req, 405);
+      }
+      return helperPageV17(req);
     }
 
     /* ---- v6.9: the relay-held session (single user, no secrets) ---- */
@@ -3290,6 +3438,15 @@ async function handle(req, event) {
      * replayed — or the client explicitly asked for redirect:'manual'
      * (x-fp-noredir, set by the runtime patch for app code that wants
      * to see the 3xx itself). */
+    /* v1.7: is this a DOCUMENT navigation? A real tab/iframe
+     * navigation says sec-fetch-mode: navigate; old webviews with
+     * no sec-fetch fall back to an accept: text/html sniff. The
+     * pocket shell's document fetches always say sec-fetch-mode:
+     * cors, so subresource and shell semantics stay exactly as
+     * before. */
+    const sfmV17 = String(req.headers.get('sec-fetch-mode') || '').toLowerCase();
+    const navDocV17 = sfmV17 === 'navigate' ||
+      (!sfmV17 && /^text\/html/.test(String(req.headers.get('accept') || '')));
     const chainSc = []; /* every set-cookie seen across hops, in order */
     if (!req.headers.get('x-fp-noredir')) {
       try {
@@ -3306,7 +3463,15 @@ async function handle(req, event) {
           let next = null;
           try { next = new URL(locH, res.url || upUrl.toString()); } catch (eNU) { next = null; }
           if (!next || !/^https?:$/.test(next.protocol)) break;      /* not walkable */
-          if (!hostAllowed(next.host, event)) break;                  /* off-family: pass the 3xx through */
+          if (!hostAllowed(next.host, event)) {
+            /* v1.7: a DOCUMENT navigation that would leave the relay
+             * must not be handed a raw 3xx to a host the phone's
+             * network may refuse outright — that is the "stranded
+             * outside the proxy" dead end. Serve the interstitial.
+             * Subresources keep browser semantics (pass-through). */
+            if (navDocV17) return escapePageV17(next.toString(), req);
+            break;                                                    /* off-family: pass the 3xx through */
+          }
           const keepBody = (stH === 307 || stH === 308);
           if (keepBody && needDuplex) break;                          /* streaming body: not replayable */
           /* fold the wave collected so far into the next hop */
@@ -3520,7 +3685,7 @@ async function handle(req, event) {
         if (navModeV15) {
           /* script-free strip — inline styles only, works under any CSP */
           const barV16 = '<div id="fp-rejbar" style="position:fixed;top:0;left:0;right:0;z-index:2147483647;box-sizing:border-box;padding:10px 14px;font:13px/1.45 Roboto,Arial,sans-serif;background:#1a73e8;color:#fff;text-align:center">' +
-            '<b>Flow Pocket</b> · Google\u2019s security check paused this sign-in for now. This clears on its own — <b>wait about 15 minutes</b> (up to an hour), then open <b>\u201cSign in with your browser\u2026\u201d</b> in Flow Pocket and try again. Retrying right away makes it stricter. Still refused after waiting? Use <b>\u201cImport sign-in from Chrome\u2026\u201d</b> in Flow Pocket instead.</div>';
+            '<b>Flow Pocket</b> · Google\u2019s security check paused this sign-in for now. This clears on its own — <b>wait about 15 minutes</b> (up to an hour), then open <b>\u201cSign in with your browser\u2026\u201d</b> in Flow Pocket and try again. Retrying right away makes it stricter. Still refused after waiting? <a href="/__helper" style="color:#fff;text-decoration:underline">Import the sign-in instead</a> — the helper page works in any browser. <a href="/" style="color:#fff;text-decoration:underline">Back to Flow</a></div>';
           if (/<body\b[^>]*>/i.test(html)) html = html.replace(/<body\b[^>]*>/i, function (mB) { return mB + barV16; });
           else html = barV16 + html;
         }
